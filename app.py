@@ -1,3 +1,5 @@
+%%writefile /kaggle/working/app.py
+
 import os
 import time
 import pandas as pd
@@ -5,312 +7,657 @@ import numpy as np
 import joblib
 import streamlit as st
 
-try:
-    from google import genai
-except Exception:
-    genai = None
-
+# -----------------------------
+# Page Configuration
+# -----------------------------
 st.set_page_config(
-    page_title="SkyGuard AI",
+    page_title="Weather Station Anomaly Detection",
     page_icon="🌦️",
     layout="wide"
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "model")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# -----------------------------
+# Paths
+# -----------------------------
+MODEL_PATH = "/kaggle/input/datasets/chandananedium/weather-anomaly-model-files/weather_anomaly_model.pkl"
+SCALER_PATH = "/kaggle/input/datasets/chandananedium/weather-anomaly-model-files/weather_scaler.pkl"
+FEATURES_PATH = "/kaggle/input/datasets/chandananedium/weather-anomaly-model-files/model_features.pkl"
+HISTORY_PATH = "/kaggle/working/historical_weather_anomalies.csv"
 
-MODEL_PATH = os.path.join(MODEL_DIR, "weather_anomaly_model.pkl")
-SCALER_PATH = os.path.join(MODEL_DIR, "weather_scaler.pkl")
-FEATURES_PATH = os.path.join(MODEL_DIR, "model_features.pkl")
-HISTORICAL_PATH = os.path.join(DATA_DIR, "historical_weather_anomalies.csv")
+# -----------------------------
+# Load Model
+# -----------------------------
+@st.cache_resource
+def load_model():
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    model_features = joblib.load(FEATURES_PATH)
+    return model, scaler, model_features
 
-model = joblib.load(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
-model_features = joblib.load(FEATURES_PATH)
+model, scaler, model_features = load_model()
 
-def identify_anomaly_type(temperature, humidity, pressure, wind_speed, wind_direction):
+# -----------------------------
+# Gemini
+# -----------------------------
+@st.cache_resource
+def load_gemini():
+    try:
+        from kaggle_secrets import UserSecretsClient
+        from google import genai
+
+        user_secrets = UserSecretsClient()
+        api_key = user_secrets.get_secret("GEMINI_API_KEY")
+
+        if not api_key:
+            return None
+
+        return genai.Client(api_key=api_key)
+
+    except Exception:
+        return None
+
+
+gemini_client = load_gemini()
+
+# -----------------------------
+# Anomaly Type
+# -----------------------------
+def identify_anomaly_type(
+    temperature,
+    humidity,
+    pressure,
+    wind_speed,
+    wind_direction
+):
     anomalies = []
 
     if temperature >= 45 or temperature <= -20:
         anomalies.append("Temperature Anomaly")
+
     if humidity <= 10 or humidity >= 100:
         anomalies.append("Humidity Anomaly")
+
     if pressure >= 1080 or pressure <= 950:
         anomalies.append("Pressure Anomaly")
+
     if wind_speed >= 20:
         anomalies.append("Wind Speed Anomaly")
+
     if wind_direction < 0 or wind_direction > 360:
         anomalies.append("Wind Direction Anomaly")
 
     if len(anomalies) >= 2:
         return "Multiple Sensor Anomaly"
+
     if len(anomalies) == 1:
         return anomalies[0]
+
     return "Pattern-Based Anomaly"
 
-def get_severity(score, temperature, humidity, pressure, wind_speed):
+
+# -----------------------------
+# Severity
+# -----------------------------
+def get_severity(
+    score,
+    temperature,
+    humidity,
+    pressure,
+    wind_speed
+):
+    # Extreme physical conditions
     if (
-        temperature >= 50 or temperature <= -20 or
-        humidity <= 10 or
-        pressure >= 1080 or pressure <= 950 or
-        wind_speed >= 30
+        temperature >= 50
+        or temperature <= -20
+        or humidity <= 10
+        or pressure >= 1080
+        or pressure <= 950
+        or wind_speed >= 30
     ):
         return "High"
 
     if (
-        temperature >= 45 or temperature <= -10 or
-        humidity <= 20 or
-        pressure >= 1060 or pressure <= 970 or
-        wind_speed >= 20
+        temperature >= 45
+        or temperature <= -10
+        or humidity <= 20
+        or pressure >= 1060
+        or pressure <= 970
+        or wind_speed >= 20
     ):
         return "Medium"
 
+    # ML score
     if score < -0.2:
         return "High"
+
     if score < -0.1:
         return "Medium"
+
     return "Low"
 
-def local_explanation(anomaly_type, severity):
-    causes = {
-        "Temperature Anomaly": "The temperature is outside the configured sensor range.",
-        "Humidity Anomaly": "The relative humidity is outside the configured sensor range.",
-        "Pressure Anomaly": "The atmospheric pressure is outside the configured sensor range.",
-        "Wind Speed Anomaly": "The wind speed is unusually high for the configured threshold.",
-        "Wind Direction Anomaly": "The wind direction is outside the valid 0–360 degree range.",
-        "Multiple Sensor Anomaly": "Multiple weather variables simultaneously crossed configured anomaly thresholds.",
-        "Pattern-Based Anomaly": "The ML model identified an unusual multivariate pattern in the sensor readings."
-    }
 
-    actions = {
-        "High": "Verify the affected sensor readings, inspect the station, and check for sensor faults or environmental extremes.",
-        "Medium": "Recheck the sensor readings and monitor the station for repeated abnormal observations.",
-        "Low": "Continue monitoring the station and compare with nearby or recent observations."
-    }
+# -----------------------------
+# Gemini Explanation
+# -----------------------------
+def get_gemini_analysis(
+    temperature,
+    humidity,
+    pressure,
+    wind_speed,
+    wind_direction,
+    anomaly_type,
+    severity,
+    anomaly_score
+):
+    prompt = f"""
+You are assisting an automatic weather station anomaly detection system.
 
-    return (
-        causes.get(anomaly_type, "The readings show an unusual condition."),
-        actions.get(severity, "Continue monitoring the station.")
-    )
-
-def gemini_analysis(temperature, humidity, pressure, wind_speed, wind_direction,
-                    anomaly_type, severity, score):
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key or genai is None:
-        return local_explanation(anomaly_type, severity)
-
-    try:
-        client = genai.Client(api_key=api_key)
-
-        prompt = f"""
-You are assisting a weather-station anomaly monitoring system.
-
-The ML detector has already detected an anomaly. Do not decide whether it is an anomaly yourself.
-Explain the detected result in simple language.
+The ML model has detected a weather station reading that requires attention.
 
 Temperature: {temperature} °C
-Relative Humidity: {humidity} %
+Humidity: {humidity} %
 Pressure: {pressure} mbar
 Wind Speed: {wind_speed} m/s
 Wind Direction: {wind_direction}°
 Anomaly Type: {anomaly_type}
 Severity: {severity}
-Isolation Forest score: {score:.4f}
+Isolation Forest Score: {anomaly_score:.4f}
 
-Return exactly two short sections:
+Give a concise response with exactly these three sections:
+
+Explanation:
+Explain why this reading is unusual.
+
 Possible Cause:
-Recommended Action:
+Give possible environmental or sensor-related causes. Do not claim certainty.
 
-Mention that the cause is a possible explanation, not a confirmed diagnosis.
+Recommended Action:
+Give practical actions for a weather station operator.
+
+Keep the answer simple and suitable for a dashboard.
 """
 
-        for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                text = response.text.strip()
-                if text:
-                    cause = text
-                    action = "Follow the recommended action generated above and verify the sensor physically."
-                    return cause, action
-            except Exception:
-                time.sleep(1)
+    if gemini_client is None:
+        return (
+            "Explanation: The weather station reading contains unusual "
+            "sensor values that require attention.\n\n"
+            "Possible Cause: The anomaly may be caused by an unusual "
+            "weather event or a sensor/data-quality issue.\n\n"
+            "Recommended Action: Compare the reading with nearby stations "
+            "and inspect the sensors if the abnormal values continue."
+        )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=prompt
+        )
+
+        if response and response.text:
+            return response.text
 
     except Exception:
         pass
 
-    return local_explanation(anomaly_type, severity)
+    return (
+        "Explanation: The weather station reading contains unusual "
+        "sensor values that require attention.\n\n"
+        "Possible Cause: The anomaly may be caused by an unusual "
+        "weather event or a sensor/data-quality issue.\n\n"
+        "Recommended Action: Compare the reading with nearby stations "
+        "and inspect the sensors if the abnormal values continue."
+    )
 
-def detect_anomaly(temperature, humidity, pressure, wind_speed, wind_direction, hour, month):
+
+# -----------------------------
+# Current Reading Detection
+# -----------------------------
+def detect_anomaly(
+    temperature,
+    humidity,
+    pressure,
+    wind_speed,
+    wind_direction,
+    hour,
+    month
+):
     data = pd.DataFrame([{
         "T (degC)": temperature,
         "rh (%)": humidity,
         "p (mbar)": pressure,
         "wv (m/s)": wind_speed,
         "wd (deg)": wind_direction,
+
         "hour": hour,
         "month": month,
+
+        # Simplified values for single-reading prototype
         "temp_rolling_mean": temperature,
         "temp_rolling_std": 0,
         "humidity_rolling_mean": humidity,
         "humidity_rolling_std": 0,
         "pressure_rolling_mean": pressure,
         "pressure_rolling_std": 0,
+
         "temp_change": 0,
         "humidity_change": 0,
         "pressure_change": 0
     }])
 
-    X_scaled = scaler.transform(data[model_features])
+    data = data[model_features]
+
+    X_scaled = scaler.transform(data)
 
     prediction = model.predict(X_scaled)[0]
     anomaly_score = model.decision_function(X_scaled)[0]
 
+    # Physical sensor safety check
     extreme_sensor_condition = (
-        temperature >= 50 or temperature <= -20
+        temperature >= 50
+        or temperature <= -20
         or humidity <= 10
-        or pressure >= 1080 or pressure <= 950
+        or pressure >= 1080
+        or pressure <= 950
         or wind_speed >= 30
-        or wind_direction < 0 or wind_direction > 360
+        or wind_direction < 0
+        or wind_direction > 360
     )
 
+    # Final anomaly decision
+    # Isolation Forest remains the ML detector.
+    # Physical check acts as an additional safety layer.
     is_anomaly = prediction == -1 or extreme_sensor_condition
 
-    if is_anomaly:
-        anomaly_type = identify_anomaly_type(
-            temperature, humidity, pressure, wind_speed, wind_direction
-        )
-        severity = get_severity(
-            anomaly_score, temperature, humidity, pressure, wind_speed
-        )
-    else:
+    anomaly_type = identify_anomaly_type(
+        temperature,
+        humidity,
+        pressure,
+        wind_speed,
+        wind_direction
+    )
+
+    if not is_anomaly:
         anomaly_type = "Normal Reading"
+
+    severity = get_severity(
+        anomaly_score,
+        temperature,
+        humidity,
+        pressure,
+        wind_speed
+    )
+
+    if not is_anomaly:
         severity = "Normal"
 
-    return is_anomaly, anomaly_score, anomaly_type, severity
+    return (
+        is_anomaly,
+        anomaly_score,
+        anomaly_type,
+        severity
+    )
 
-st.title("🌦️ SkyGuard AI")
-st.subheader("AI/ML-Based Intelligent Anomaly Detection for Automatic Weather Stations")
+
+# -----------------------------
+# Sidebar
+# -----------------------------
+st.sidebar.title("🌦️ Weather Station Input")
+
+temperature = st.sidebar.number_input(
+    "Temperature (°C)",
+    min_value=-50.0,
+    max_value=70.0,
+    value=25.0,
+    step=0.1
+)
+
+humidity = st.sidebar.number_input(
+    "Humidity (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=60.0,
+    step=0.1
+)
+
+pressure = st.sidebar.number_input(
+    "Pressure (mbar)",
+    min_value=900.0,
+    max_value=1150.0,
+    value=1015.0,
+    step=0.1
+)
+
+wind_speed = st.sidebar.number_input(
+    "Wind Speed (m/s)",
+    min_value=0.0,
+    max_value=60.0,
+    value=2.5,
+    step=0.1
+)
+
+wind_direction = st.sidebar.number_input(
+    "Wind Direction (°)",
+    min_value=0.0,
+    max_value=360.0,
+    value=180.0,
+    step=1.0
+)
+
+hour = st.sidebar.number_input(
+    "Hour",
+    min_value=0,
+    max_value=23,
+    value=12,
+    step=1
+)
+
+month = st.sidebar.number_input(
+    "Month",
+    min_value=1,
+    max_value=12,
+    value=9,
+    step=1
+)
+
+detect_button = st.sidebar.button(
+    "🔍 Detect Anomaly",
+    use_container_width=True
+)
+
+# -----------------------------
+# Title
+# -----------------------------
+st.title("🌦️ Intelligent Weather Station Anomaly Detection")
 
 st.write(
-    "Isolation Forest detects unusual weather-station readings, while Gemini "
-    "provides explainable insights and recommended actions."
+    "AI/ML-based monitoring system for detecting unusual "
+    "weather station observations and generating actionable explanations."
 )
 
-with st.sidebar:
-    st.header("Weather Station Input")
+# -----------------------------
+# Detection
+# -----------------------------
+if detect_button:
 
-    temperature = st.number_input("Temperature (°C)", value=25.0)
-    humidity = st.number_input("Relative Humidity (%)", min_value=0.0, max_value=100.0, value=60.0)
-    pressure = st.number_input("Atmospheric Pressure (mbar)", value=1015.0)
-    wind_speed = st.number_input("Wind Speed (m/s)", min_value=0.0, value=2.5)
-    wind_direction = st.number_input("Wind Direction (°)", value=180.0)
-    hour = st.slider("Hour", 0, 23, 12)
-    month = st.slider("Month", 1, 12, 9)
-
-    analyze = st.button("Analyze Reading", use_container_width=True)
-
-if analyze:
-    is_anomaly, score, anomaly_type, severity = detect_anomaly(
-        temperature, humidity, pressure, wind_speed, wind_direction, hour, month
+    (
+        is_anomaly,
+        anomaly_score,
+        anomaly_type,
+        severity
+    ) = detect_anomaly(
+        temperature,
+        humidity,
+        pressure,
+        wind_speed,
+        wind_direction,
+        hour,
+        month
     )
+
+    st.subheader("Current Weather Reading")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric("Temperature", f"{temperature:.1f} °C")
+    c2.metric("Humidity", f"{humidity:.1f} %")
+    c3.metric("Pressure", f"{pressure:.1f} mbar")
+    c4.metric("Wind Speed", f"{wind_speed:.1f} m/s")
+    c5.metric("Wind Direction", f"{wind_direction:.0f}°")
+
+    st.divider()
 
     if is_anomaly:
-        st.error("🚨 ANOMALY DETECTED")
-        st.metric("Anomaly Type", anomaly_type)
-        st.metric("Severity", severity)
-
-        st.write(f"**Anomaly Score:** `{score:.4f}`")
-        st.caption("The Isolation Forest score is a relative anomaly score; lower values indicate more unusual observations.")
-
-        with st.spinner("Generating AI explanation..."):
-            possible_cause, recommended_action = gemini_analysis(
-                temperature, humidity, pressure, wind_speed,
-                wind_direction, anomaly_type, severity, score
-            )
-
-        st.subheader("Possible Cause")
-        st.write(possible_cause)
-
-        st.subheader("Recommended Action")
-        st.write(recommended_action)
-
+        st.error("⚠️ ANOMALY DETECTED")
     else:
         st.success("✅ NORMAL READING")
-        st.metric("Status", "Normal")
-        st.write(f"**Anomaly Score:** `{score:.4f}`")
-        st.write("The current reading was not flagged as anomalous by the ML detector.")
 
-st.divider()
+    a1, a2, a3 = st.columns(3)
 
-st.header("Historical Weather Analysis")
+    a1.metric("Anomaly Type", anomaly_type)
+    a2.metric("Severity", severity)
+    a3.metric("Anomaly Score", f"{anomaly_score:.4f}")
 
-if os.path.exists(HISTORICAL_PATH):
-    historical_df = pd.read_csv(HISTORICAL_PATH)
+    st.subheader("🤖 Gemini AI Analysis")
 
-    col1, col2, col3 = st.columns(3)
+    with st.spinner("Generating AI analysis..."):
 
-    total_readings = len(historical_df)
-    anomaly_count = len(historical_df[historical_df["prediction"] == -1]) if "prediction" in historical_df.columns else len(historical_df)
-    anomaly_percentage = (anomaly_count / total_readings * 100) if total_readings else 0
-
-    col1.metric("Historical Readings", f"{total_readings:,}")
-    col2.metric("Detected Anomalies", f"{anomaly_count:,}")
-    col3.metric("Anomaly Percentage", f"{anomaly_percentage:.2f}%")
-
-    if "Date Time" in historical_df.columns:
-        historical_df["Date Time"] = pd.to_datetime(historical_df["Date Time"], errors="coerce")
-
-    if "T (degC)" in historical_df.columns:
-        st.subheader("Temperature Trend")
-        st.line_chart(historical_df.set_index("Date Time")["T (degC)"])
-
-    if "T (degC)" in historical_df.columns and "prediction" in historical_df.columns:
-        st.subheader("Historical Anomaly Points")
-        chart_df = historical_df.set_index("Date Time")[["T (degC)"]].copy()
-        chart_df["Anomaly"] = np.where(
-            historical_df.set_index("Date Time")["prediction"] == -1,
-            chart_df["T (degC)"],
-            np.nan
+        analysis = get_gemini_analysis(
+            temperature,
+            humidity,
+            pressure,
+            wind_speed,
+            wind_direction,
+            anomaly_type,
+            severity,
+            anomaly_score
         )
-        st.line_chart(chart_df)
 
-    if "rh (%)" in historical_df.columns:
-        st.subheader("Humidity Trend")
-        st.line_chart(historical_df.set_index("Date Time")["rh (%)"])
+    st.info(analysis)
 
-    st.subheader("Detected Anomalies")
-    display_df = historical_df.copy()
-
-    if "prediction" in display_df.columns:
-        display_df = display_df[display_df["prediction"] == -1]
-
-    st.dataframe(display_df, use_container_width=True)
-
-    st.download_button(
-        "Download Historical Anomaly Report",
-        data=historical_df.to_csv(index=False).encode("utf-8"),
-        file_name="historical_weather_anomalies.csv",
-        mime="text/csv"
-    )
 else:
-    st.info("Historical anomaly CSV was not found. Add it to the data/ folder.")
 
+    st.info(
+        "Enter weather station values in the sidebar and click "
+        "**Detect Anomaly**."
+    )
+
+# -----------------------------
+# Historical Analysis
+# -----------------------------
 st.divider()
 
-st.header("System Architecture")
-st.code(
-    "Weather Data → Feature Processing → Isolation Forest ML Detector → "
-    "Normal/Anomaly → Sensor Safety Check → Anomaly Type & Severity → "
-    "Gemini Explanation/Recommendation → Streamlit Dashboard"
+st.header("📊 Historical Weather Analysis")
+
+if os.path.exists(HISTORY_PATH):
+
+    try:
+        historical_df = pd.read_csv(HISTORY_PATH)
+
+        if "Date Time" in historical_df.columns:
+            historical_df["Date Time"] = pd.to_datetime(
+                historical_df["Date Time"],
+                errors="coerce"
+            )
+
+        total_readings = len(historical_df)
+
+        if "prediction" in historical_df.columns:
+            anomaly_count = (
+                historical_df["prediction"] == -1
+            ).sum()
+        else:
+            anomaly_count = 0
+
+        anomaly_percentage = (
+            anomaly_count / total_readings * 100
+            if total_readings > 0
+            else 0
+        )
+
+        h1, h2, h3 = st.columns(3)
+
+        h1.metric(
+            "Historical Readings",
+            f"{total_readings:,}"
+        )
+
+        h2.metric(
+            "Detected Anomalies",
+            f"{anomaly_count:,}"
+        )
+
+        h3.metric(
+            "Anomaly Percentage",
+            f"{anomaly_percentage:.2f}%"
+        )
+
+        # -----------------------------
+        # Temperature Trend
+        # -----------------------------
+        st.subheader("🌡️ Temperature Trend")
+
+        if "T (degC)" in historical_df.columns:
+
+            temp_chart = historical_df[
+                ["Date Time", "T (degC)"]
+            ].dropna()
+
+            if not temp_chart.empty:
+
+                temp_chart = temp_chart.set_index("Date Time")
+
+                st.line_chart(
+                    temp_chart["T (degC)"]
+                )
+
+        # -----------------------------
+        # Historical Anomalies
+        # -----------------------------
+        st.subheader("🔴 Historical Anomaly Points")
+
+        if (
+            "T (degC)" in historical_df.columns
+            and "prediction" in historical_df.columns
+        ):
+
+            anomaly_points = historical_df[
+                historical_df["prediction"] == -1
+            ][
+                ["Date Time", "T (degC)"]
+            ].dropna()
+
+            if not anomaly_points.empty:
+
+                anomaly_points = anomaly_points.set_index(
+                    "Date Time"
+                )
+
+                st.scatter_chart(
+                    anomaly_points["T (degC)"]
+                )
+
+            else:
+                st.info("No historical anomalies found.")
+
+        # -----------------------------
+        # Humidity Trend
+        # -----------------------------
+        st.subheader("💧 Humidity Trend")
+
+        if "rh (%)" in historical_df.columns:
+
+            humidity_chart = historical_df[
+                ["Date Time", "rh (%)"]
+            ].dropna()
+
+            if not humidity_chart.empty:
+
+                humidity_chart = humidity_chart.set_index(
+                    "Date Time"
+                )
+
+                st.line_chart(
+                    humidity_chart["rh (%)"]
+                )
+
+        # -----------------------------
+        # Anomaly Table
+        # -----------------------------
+        st.subheader("⚠️ Detected Anomalies")
+
+        if "prediction" in historical_df.columns:
+
+            anomaly_table = historical_df[
+                historical_df["prediction"] == -1
+            ].copy()
+
+            if not anomaly_table.empty:
+
+                display_columns = [
+                    "Date Time",
+                    "T (degC)",
+                    "rh (%)",
+                    "p (mbar)",
+                    "wv (m/s)",
+                    "wd (deg)",
+                    "anomaly_score",
+                    "anomaly_type",
+                    "severity"
+                ]
+
+                available_columns = [
+                    col
+                    for col in display_columns
+                    if col in anomaly_table.columns
+                ]
+
+                st.dataframe(
+                    anomaly_table[available_columns],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                csv_data = anomaly_table.to_csv(
+                    index=False
+                )
+
+                st.download_button(
+                    "⬇️ Download Anomaly Report",
+                    data=csv_data,
+                    file_name="historical_weather_anomalies.csv",
+                    mime="text/csv"
+                )
+
+            else:
+                st.info("No anomalies available.")
+
+    except Exception as e:
+
+        st.error(
+            f"Unable to load historical analysis: {e}"
+        )
+
+else:
+
+    st.warning(
+        "Historical anomaly file not found at "
+        f"{HISTORY_PATH}"
+    )
+
+# -----------------------------
+# System Architecture
+# -----------------------------
+st.divider()
+
+st.header("⚙️ System Architecture")
+
+st.markdown(
+    """
+**Weather Station Data**  
+↓  
+**Feature Processing**  
+↓  
+**Isolation Forest ML Model**  
+↓  
+**Normal / Anomaly Detection**  
+↓  
+**Sensor Safety Check**  
+↓  
+**Anomaly Type + Severity**  
+↓  
+**Gemini AI Explanation**  
+↓  
+**Recommended Action**
+"""
 )
 
-st.header("System Status")
-c1, c2, c3 = st.columns(3)
-c1.success("ML Detector: Isolation Forest")
-c2.success("Historical Analysis: Active")
-c3.success("AI Assistant: Gemini")
+# -----------------------------
+# System Status
+# -----------------------------
+st.header("🟢 System Status")
+
+s1, s2, s3 = st.columns(3)
+
+s1.success("ML Detector\n\nIsolation Forest")
+s2.success("Historical Analysis\n\nActive")
+s3.success("AI Assistant\n\nGemini")
